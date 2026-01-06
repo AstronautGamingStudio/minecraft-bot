@@ -354,7 +354,7 @@ function startBot() {
             const path = require('path'); const fs = require('fs');
             const MODELS_ROOT = path.resolve(__dirname, 'models');
             // merge old generation checkpoints and prune global checkpoints first
-            try { if (typeof manager.mergeAndPruneGenerations === 'function') manager.mergeAndPruneGenerations(10); } catch (e) {}
+            try { if (typeof manager.revampSaveSystem === 'function') manager.revampSaveSystem(10); } catch (e) {}
             try { if (typeof manager.pruneGlobal === 'function') manager.pruneGlobal(10); } catch (e) {}
             // For each task directory, combine top candidates and keep only newest N files
             const TARGET_PER_TASK = parseInt(process.env.CLEAN_TARGET_PER_TASK || '10');

@@ -7,7 +7,9 @@ const argv = process.argv.slice(2);
 const host = argv[0] || 'localhost';
 const port = argv[1] ? parseInt(argv[1]) : undefined;
 const username = argv[2] || 'EvalBot';
+// model path and optional epsilon
 const model = argv[3] || 'models/best-latest.json';
+const epsilon = argv[4] ? parseFloat(argv[4]) : undefined;
 
 async function runEval() {
   if (!model) throw new Error('Provide model path');
@@ -19,7 +21,9 @@ async function runEval() {
   bot.on('spawn', async () => {
     console.log('Bot spawned, starting model-driven collect for a brief demo');
     try {
-      await adapter.runCollect(bot, { stepDelay: 600, maxSteps: 400 });
+      const opts = { stepDelay: 600, maxSteps: 400 };
+      if (typeof epsilon === 'number' && !Number.isNaN(epsilon)) opts.epsilon = epsilon;
+      await adapter.runCollect(bot, opts);
       console.log('Eval run completed');
       process.exit(0);
     } catch (e) {

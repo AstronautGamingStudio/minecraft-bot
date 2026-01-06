@@ -9,13 +9,26 @@ const modelManager = require('../modules/models/manager');
 
 // Config (tweakable via CLI args)
 const POP_SIZE = parseInt(process.env.POP_SIZE || 40);
-const INPUTS = 6; // all envs share 6-element observation vector for now
+const INPUTS = 10; // observation vector expanded to include health, food, mobNear, invFrac
 const OUTPUTS = 5; // up,down,left,right,interact
 const GENERATIONS = parseInt(process.env.GENERATIONS || 60);
 const EPISODES = parseInt(process.env.EPISODES || 4);
 const TASKS = (process.env.TASKS || 'collect').split(',').map(t=>t.trim());
 const MODELS_DIR = path.resolve(__dirname, '..', 'models');
 if (!fs.existsSync(MODELS_DIR)) fs.mkdirSync(MODELS_DIR, { recursive: true });
+
+// Simple CLI flag parsing for simulated environment params
+const rawArgs = process.argv.slice(2);
+function parseFlag(name) {
+  const prefix = `--${name}=`;
+  for (const a of rawArgs) if (a.startsWith(prefix)) return a.slice(prefix.length);
+  return undefined;
+}
+const simOptions = {};
+const h = parseFlag('health'); if (h !== undefined) simOptions.health = parseFloat(h);
+const f = parseFlag('food'); if (f !== undefined) simOptions.food = parseFloat(f);
+const m = parseFlag('mob'); if (m !== undefined) simOptions.mobNear = parseFloat(m);
+const inv = parseFlag('inv'); if (inv !== undefined) simOptions.invFrac = parseFloat(inv);
 
 let stopRequested = false;
 let sigintCount = 0;
@@ -32,11 +45,11 @@ process.on('SIGINT', () => {
   }
 });
 
-function _makeEnv(taskName) {
-  if (taskName === 'collect') return new CollectEnv({ size: 8, nItems: 3, maxSteps: 80 });
-  if (taskName === 'mine') return new MineEnv({ size: 8, nOres: 3, maxSteps: 100 });
-  if (taskName === 'build') return new BuildEnv({ size: 8, nBlocks: 4, maxSteps: 90 });
-  if (taskName === 'pvp') return new PvPEnv({ size: 8, maxSteps: 120 });
+function _makeEnv(taskName, opts = {}) {
+  if (taskName === 'collect') return new CollectEnv(Object.assign({ size: 8, nItems: 3, maxSteps: 80 }, opts));
+  if (taskName === 'mine') return new MineEnv(Object.assign({ size: 8, nOres: 3, maxSteps: 100 }, opts));
+  if (taskName === 'build') return new BuildEnv(Object.assign({ size: 8, nBlocks: 4, maxSteps: 90 }, opts));
+  if (taskName === 'pvp') return new PvPEnv(Object.assign({ size: 8, maxSteps: 120 }, opts));
   throw new Error('Unknown task: ' + taskName);
 }
 
@@ -44,7 +57,7 @@ function evaluateNetwork(network) {
   // Multi-task evaluation: return overall average and per-task scores
   const per = {};
   for (const taskName of TASKS) {
-    const env = _makeEnv(taskName);
+  const env = _makeEnv(taskName, simOptions);
     let epTotal = 0;
     for (let ep = 0; ep < EPISODES; ep++) {
       let obs = env.reset();
@@ -79,13 +92,42 @@ async function run() {
   if (fs.existsSync(seedPath)) {
     try {
       const seedJson = JSON.parse(fs.readFileSync(seedPath));
-      const seedNet = neataptic.Network.fromJSON(seedJson);
-      // replace worst genomes with mutated copies of seed to accelerate improvement
-      neat.population.sort((a,b)=> a.score - b.score);
-      for (let i = 0; i < Math.min(3, neat.population.length); i++) {
-        neat.population[i] = neataptic.Network.fromJSON(seedJson);
+      // detect seed input size
+      let seedInput = null;
+      try { if (Array.isArray(seedJson.nodes)) seedInput = seedJson.nodes.filter(n => n.type === 'input').length; } catch (e) { seedInput = null; }
+      if (seedInput && seedInput !== INPUTS) {
+        if (seedInput < INPUTS) {
+          // attempt simple conversion: add extra isolated input nodes to JSON so network accepts larger obs
+          const mod = JSON.parse(JSON.stringify(seedJson));
+          const nodes = mod.nodes || [];
+          const maxId = nodes.reduce((m,n)=> Math.max(m, (typeof n.id==='number'?n.id: -1)), -1);
+          for (let k = 0; k < (INPUTS - seedInput); k++) {
+            nodes.push({ id: maxId + 1 + k, type: 'input', bias: 0, squash: 'LOGISTIC' });
+          }
+          mod.nodes = nodes;
+          try {
+            const seedNet2 = neataptic.Network.fromJSON(mod);
+            neat.population.sort((a,b)=> a.score - b.score);
+            for (let i = 0; i < Math.min(3, neat.population.length); i++) {
+              neat.population[i] = seedNet2.clone ? seedNet2.clone() : neataptic.Network.fromJSON(mod);
+            }
+            console.log('  Seeded population from previous best (auto-converted inputs)');
+          } catch (e) {
+            console.warn('  Auto-conversion of seed failed, skipping seed:', e.message);
+          }
+        } else {
+          console.warn('  Seed model expects more inputs than trainer (skipping seed).');
+        }
+      } else {
+        try {
+          const seedNet = neataptic.Network.fromJSON(seedJson);
+          neat.population.sort((a,b)=> a.score - b.score);
+          for (let i = 0; i < Math.min(3, neat.population.length); i++) {
+            neat.population[i] = neataptic.Network.fromJSON(seedJson);
+          }
+          console.log('  Seeded population from previous best');
+        } catch (e) { console.warn('  Failed to seed from best-latest', e); }
       }
-      console.log('  Seeded population from previous best');
     } catch (e) { console.warn('  Failed to seed from best-latest', e); }
   }
 
