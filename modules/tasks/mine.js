@@ -44,15 +44,20 @@ module.exports = {
 
     bot.chat(`Target block: ${targetBlock.name} at ${targetBlock.position}`);
 
-    // navigate adjacent to the block
-    const goal = new GoalNear(targetBlock.position.x, targetBlock.position.y, targetBlock.position.z, 2);
+    // navigate adjacent to the block (try to get close enough for 3D dig)
     try {
-      const ok = await nav.goto(bot, targetBlock.position, 2);
+      const ok = await nav.goto(bot, targetBlock.position, 1);
       if (!ok) { bot.chat('Failed to path to block (no route).'); return; }
     } catch (err) {
       bot.chat('Failed to path to block: ' + err.message);
       return;
     }
+
+    // Ensure we have at least a pickaxe/tool before starting
+    try {
+      const craft = require('../brain/crafting');
+      await craft.ensureTool(bot, 'pickaxe');
+    } catch (e) {}
 
     // Mine `amount` blocks of this type (re-acquire targets each loop)
     const actions = require('../utils/actions');
@@ -65,23 +70,10 @@ module.exports = {
       else blk = bot.findBlock({ matching: (b) => b && b.name && b.name.includes(blockName), maxDistance: 64 });
       if (!blk) { bot.chat(`No more blocks matching ${blockName} found nearby`); break; }
       try {
-        const ok = await nav.goto(bot, blk.position, 2);
-        if (!ok) { bot.chat('Failed to reach block, skipping'); continue; }
-        // equip tool if needed
-        const isPick = /ore|stone|deepslate/.test(blk.name);
-        if (isPick) {
-          const pick = bot.inventory.items().find(i => i.name && i.name.includes('pickaxe'));
-          if (pick) await bot.equip(pick, 'hand');
-          else {
-            try {
-              const tools = require('../utils/tools');
-              const found = await tools.findToolInChests(bot);
-              if (found) await bot.equip(found, 'hand');
-            } catch (e) {}
-          }
-        }
-        const success = await actions.digBlock(bot, blk, 20000);
-        if (success) { done++; bot.chat(`Dug ${done}/${amount}: ${blk.name}`); }
+        // use centralized action.performDig which handles adjacency and tool equip
+        const brainAction = require('../brain/action');
+        const res = await brainAction.performDig(bot, blk, { timeout: 20000 });
+        if (res) { done++; bot.chat(`Dug ${done}/${amount}: ${blk.name}`); }
         else bot.chat('Failed to dig block within timeout');
       } catch (err) { bot.chat('Dig error: ' + (err.message || err)); }
       await new Promise(r => setTimeout(r, 400));

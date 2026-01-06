@@ -4,7 +4,8 @@ const neataptic = require('neataptic');
 
 let loadedNetwork = null;
 let watcher = null;
-let config = { epsilon: 0.05, outputs: 5 };
+let taskWatchers = {};
+let config = { epsilon: 0.05, outputs: 5, inputs: 10 };
 
 function loadModel(modelPath) {
   if (!fs.existsSync(modelPath)) throw new Error('Model not found: ' + modelPath);
@@ -18,6 +19,39 @@ function loadModel(modelPath) {
       modelInputSize = json.input;
     }
   } catch (e) { modelInputSize = null; }
+
+  // If JSON model has fewer inputs than current config, attempt to auto-convert by
+  // adding isolated input nodes and small random outgoing connections so new inputs can influence the net.
+  if (typeof modelInputSize === 'number' && modelInputSize < config.inputs) {
+    try {
+      const nodes = Array.isArray(json.nodes) ? json.nodes.slice() : [];
+      const connections = Array.isArray(json.connections) ? json.connections.slice() : [];
+      const maxId = nodes.reduce((m, n) => Math.max(m, (typeof n.id === 'number' ? n.id : -1)), -1);
+      const addCount = config.inputs - modelInputSize;
+      const newIds = [];
+      for (let k = 0; k < addCount; k++) {
+        const nid = maxId + 1 + k;
+        newIds.push(nid);
+        nodes.push({ id: nid, type: 'input', bias: 0, squash: 'LOGISTIC' });
+      }
+      // connect new inputs to all non-input nodes with small random weights
+      for (const nid of newIds) {
+        for (const target of nodes) {
+          if (target.type && target.type !== 'input') {
+            connections.push({ from: nid, to: target.id, weight: (Math.random() * 0.2) - 0.1 });
+          }
+        }
+      }
+      json.nodes = nodes;
+      json.connections = connections;
+      // save a converted copy for inspection
+      try {
+        const outPath = path.join(path.dirname(modelPath), `converted-${path.basename(modelPath)}`);
+        fs.writeFileSync(outPath, JSON.stringify(json));
+        console.log('Saved converted model to', outPath);
+      } catch (e) { /* ignore save errors */ }
+    } catch (e) { console.warn('Model auto-conversion failed:', e.message); }
+  }
 
   loadedNetwork = neataptic.Network.fromJSON(json);
   // attach detected input size for runtime observation mapping
@@ -106,6 +140,57 @@ function startWatch(modelPath) {
 
 function stopWatch() {
   if (watcher) { watcher.close(); watcher = null; console.log('Stopped model watch'); }
+}
+
+function loadBestForTask(task) {
+  try {
+    const manager = require('../models/manager');
+    const best = manager.bestFor(task);
+    if (best) {
+      loadModel(best);
+      console.log('Loaded per-task best for', task, best);
+      return true;
+    }
+  } catch (e) { console.warn('loadBestForTask failed:', e.message); }
+  return false;
+}
+
+function startTaskWatch(task) {
+  stopTaskWatch(task);
+  try {
+    const dir = require('path').resolve(__dirname, '..', '..', 'models', task);
+    if (!fs.existsSync(dir)) return false;
+    const w = fs.watch(dir, (ev, fname) => {
+      if (!fname) return;
+      // on any new/changed file, load best candidate
+      try { loadBestForTask(task); } catch (e) { console.warn('task watch load failed', e.message); }
+    });
+    taskWatchers[task] = w;
+    console.log('Started task watcher for', task);
+    // attempt initial load
+    loadBestForTask(task);
+    return true;
+  } catch (e) { console.warn('startTaskWatch failed:', e.message); return false; }
+}
+
+function stopTaskWatch(task) {
+  try {
+    if (taskWatchers[task]) { taskWatchers[task].close(); delete taskWatchers[task]; console.log('Stopped task watcher for', task); }
+  } catch (e) {}
+}
+
+function startAllTaskWatches() {
+  try {
+    const MODELS_ROOT = require('path').resolve(__dirname, '..', '..', 'models');
+    if (!fs.existsSync(MODELS_ROOT)) return false;
+    const items = fs.readdirSync(MODELS_ROOT, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name).filter(n => n !== 'saves');
+    for (const t of items) startTaskWatch(t);
+    return true;
+  } catch (e) { console.warn('startAllTaskWatches failed', e.message); return false; }
+}
+
+function stopAllTaskWatches() {
+  try { Object.keys(taskWatchers).forEach(t => stopTaskWatch(t)); return true; } catch (e) { return false; }
 }
 
 module.exports = { loadModel, act, available, startWatch, stopWatch, predictProbs, setConfig };

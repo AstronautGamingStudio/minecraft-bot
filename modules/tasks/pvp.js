@@ -27,15 +27,26 @@ module.exports = {
     }
 
     // find a target
-    let targetEntity = null;
-    if (choice === 'nearest') {
-      const entities = Object.values(bot.entities).filter(e => e.type === 'mob' || e.type === 'player');
-      // prefer non-friends and non-awaiting players
-      let sorted = entities.filter(e => e !== bot.entity && e.position).sort((a,b) => bot.entity.position.distanceTo(a.position) - bot.entity.position.distanceTo(b.position));
-      targetEntity = sorted[0];
-    } else {
-      targetEntity = Object.values(bot.entities).find(e => e.username === choice || (e.metadata && e.metadata.name && e.metadata.name.includes(choice)));
-    }
+      let targetEntity = null;
+      // initialize hostile tracking
+      const logic = require('../brain/logic');
+      try { logic.init(bot); } catch (e) {}
+      if (choice && typeof choice === 'object' && choice.id) {
+        // caller passed an entity directly
+        targetEntity = choice;
+      } else if (choice === 'nearest') {
+        // prefer recent hostiles (things that attacked us)
+        const hostile = logic.getNearestHostile(bot);
+        if (hostile) targetEntity = hostile;
+        else {
+          const entities = Object.values(bot.entities).filter(e => e.type === 'mob' || e.type === 'player');
+          // prefer non-friends and non-awaiting players
+          let sorted = entities.filter(e => e !== bot.entity && e.position).sort((a,b) => bot.entity.position.distanceTo(a.position) - bot.entity.position.distanceTo(b.position));
+          targetEntity = sorted[0];
+        }
+      } else {
+        targetEntity = Object.values(bot.entities).find(e => e.username === choice || (e.metadata && e.metadata.name && e.metadata.name.includes(choice)));
+      }
 
     if (!targetEntity) { bot.chat('No target found for PvP.'); return; }
 
@@ -45,7 +56,15 @@ module.exports = {
     try { bot.loadPlugin(pathfinder); } catch (e) {}
     const mcData = require('minecraft-data')(bot.version);
     const defaultMove = new Movements(bot, mcData);
-    bot.pathfinder.setMovements(defaultMove);
+    try {
+      if (bot.pathfinder && bot.pathfinder.setMovements) {
+        bot.pathfinder.setMovements(defaultMove);
+      } else {
+        console.warn('PvP: pathfinder not available — skipping setMovements');
+      }
+    } catch (e) {
+      console.warn('PvP: error while setting pathfinder movements:', e && e.message);
+    }
 
     // Choose best weapon available (axe or sword) and attempt flanking patterns; support shield, bow, and potions
     // Weapons preference
@@ -121,8 +140,13 @@ module.exports = {
           const burst = 3;
           for (let i=0;i<burst;i++) {
             if (!bot.entities[targetEntity.id]) break;
-            try { await bot.attack(targetEntity, true); } catch (e) { /* ignore */ }
+            try { await bot.attack(targetEntity, true); try { bot._stats = bot._stats || {}; bot._stats.attacks = (bot._stats.attacks||0)+1; } catch(e){} } catch (e) { /* ignore */ }
             await new Promise(r => setTimeout(r, 300));
+          }
+
+          // if target disappeared after our burst, count as kill
+          if (!bot.entities[targetEntity.id]) {
+            try { bot._stats = bot._stats || {}; bot._stats.kills = (bot._stats.kills||0)+1; } catch(e){}
           }
 
           // Drop shield usage

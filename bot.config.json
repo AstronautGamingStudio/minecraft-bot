@@ -1,0 +1,11 @@
+{
+  "persistModel": null,
+  "autoWatch": false,
+  "autoStartModel": false,
+  "authAutoRefresh": false,
+  "chat": {
+    "maxPerWindow": 2,
+    "minMs": 3200,
+    "windowMs": 30000
+  }
+}

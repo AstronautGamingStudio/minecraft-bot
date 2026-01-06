@@ -28,7 +28,7 @@ async function goto(bot, target, range = 1, timeout = 30000, options = {}) {
   try {
     const actions = require('../utils/actions');
     // whitelist of safe diggable block name fragments (configurable via DIG_WHITELIST env var)
-    const DEFAULT_WHITELIST = ['dirt','grass','cobblestone','stone','planks','log','sand','gravel','wood'];
+    const DEFAULT_WHITELIST = ['dirt','grass','cobblestone','stone','planks','log','sand','gravel','wood','concrete','terracotta','deepslate','andesite','granite','diorite','mossy','netherrack'];
     const WHITELIST = (process.env.DIG_WHITELIST ? process.env.DIG_WHITELIST.split(',') : DEFAULT_WHITELIST).map(s => s.trim().toLowerCase()).filter(Boolean);
     let lastPos = bot.entity.position.clone();
     let stuckCount = 0;
@@ -51,38 +51,45 @@ async function goto(bot, target, range = 1, timeout = 30000, options = {}) {
       lastPos = bot.entity.position.clone();
 
       if (stuckCount >= 4) {
-        // attempt to dig a blocking block in front of the bot before other maneuvers
-          try {
-            const dir = pos.minus(bot.entity.position).normalize();
-            const probe = bot.entity.position.offset(Math.round(dir.x), 0, Math.round(dir.z));
-            const block = bot.blockAt(probe);
-            if (block && block.name && block.name !== 'air') {
+        // attempt to dig blocking blocks in front, at feet, and at head before other maneuvers
+        try {
+          const dir = pos.minus(bot.entity.position).normalize();
+          const probes = [];
+          probes.push(bot.entity.position.offset(Math.round(dir.x), 0, Math.round(dir.z))); // front
+          probes.push(bot.entity.position); // feet
+          probes.push(bot.entity.position.offset(0, 1, 0)); // head
+          let dugAny = false;
+          for (const probe of probes) {
+            try {
+              const block = bot.blockAt(probe);
+              if (!block || block.name === 'air') continue;
               const name = (block.name || '').toLowerCase();
-              // only attempt to dig if in whitelist and not dangerous, unless aggressive dig enabled
               const dangerous = /lava|bedrock|fire|portal|lava_cauldron/.test(name);
               const ok = WHITELIST.some(w => name.includes(w));
-              const allowAggressive = (options.allowDig !== undefined) ? !!options.allowDig : true; // default to allow digging
+              const allowAggressive = (options.allowDig !== undefined) ? !!options.allowDig : (!!bot._aggressiveDig);
               if ((!dangerous) && (ok || allowAggressive)) {
                 try {
                   const dug = await actions.digBlock(bot, block, 5000);
-                  if (dug) { stuckCount = 0; continue; }
+                  if (dug) { stuckCount = 0; dugAny = true; break; }
                 } catch (e) {}
               }
-              // if digging didn't work or not permitted, try building a step over the blocking block
-              try {
-                const above = bot.blockAt(probe.offset(0,1,0));
-                if ((!above || above.name === 'air') && !dangerous) {
-                  // find a placeable block in inventory
-                  const placePref = ['dirt','cobblestone','stone','planks','sand','gravel'];
-                  const invBlock = bot.inventory.items().find(i => i.name && placePref.some(p => i.name.includes(p)));
-                  if (invBlock) {
-                    const placed = await actions.placeBlock(bot, block, invBlock);
-                    if (placed) { stuckCount = 0; continue; }
-                  }
-                }
-              } catch (e) {}
+            } catch (e) {}
+          }
+          if (dugAny) { continue; }
+
+          // if digging didn't work or not permitted, try building a step over the blocking block
+          try {
+            const above = bot.blockAt(bot.entity.position.offset(0,1,0));
+            if ((!above || above.name === 'air')) {
+              const placePref = ['dirt','cobblestone','stone','planks','sand','gravel'];
+              const invBlock = bot.inventory.items().find(i => i.name && placePref.some(p => i.name.includes(p)));
+              if (invBlock) {
+                const placed = await actions.placeBlock(bot, bot.blockAt(bot.entity.position), invBlock);
+                if (placed) { stuckCount = 0; continue; }
+              }
             }
           } catch (e) {}
+        } catch (e) {}
 
         // fallback unstuck maneuvers: jump + random strafe
         try { bot.setControlState('jump', true); } catch (e) {}

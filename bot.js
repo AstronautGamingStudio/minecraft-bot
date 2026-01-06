@@ -52,6 +52,7 @@ const { spawn } = require('child_process');
 
 let bot = null;
 const authFilePath = require('path').resolve(__dirname, 'auth.json');
+let reconnecting = false;
 
 function buildOptionsFromArgsAndAuth() {
   const opts = Object.assign({}, options);
@@ -85,35 +86,50 @@ function startBot() {
 
   bot = mineflayer.createBot(startOptions);
 
-  // Rate-limited chat queue to avoid chat-spam kicks
+  // Protect against accidental quits: only allow quit/end when bot._allowQuit === true
   try {
-    const MIN_CHAT_MS = parseInt(process.env.CHAT_MIN_MS || '1200'); // default 1.2s between messages
+    bot._allowQuit = false;
+    if (typeof bot.quit === 'function') {
+      bot._origQuit = bot.quit.bind(bot);
+      bot.quit = function(msg) {
+        if (bot._allowQuit) return bot._origQuit(msg);
+        console.log('Blocked quit call (not allowed):', msg);
+      };
+    }
+    if (typeof bot.end === 'function') {
+      bot._origEnd = bot.end.bind(bot);
+      bot.end = function() {
+        if (bot._allowQuit) return bot._origEnd();
+        console.log('Blocked end call (not allowed)');
+      };
+    }
+  } catch (e) {}
+
+  // Rate-limited chat queue to avoid chat-spam kicks (runtime-configurable)
+  try {
     bot._chatQueue = [];
     bot._chatBusy = false;
-    // Enhanced enqueue: dedupe similar messages within a short window, enforce per-window rate limits and jitter
     bot._chatHistory = []; // {msg, ts}
-    const WINDOW_MS = parseInt(process.env.CHAT_WINDOW_MS || '30000'); // default 30s window
-    const MAX_PER_WINDOW = parseInt(process.env.CHAT_MAX_PER_WINDOW || '6');
+    // pull persisted chat settings from config if present
+    const cfgChat = (config.load && config.load().chat) || {};
+    bot._chatMinMs = parseInt(process.env.CHAT_MIN_MS || cfgChat.minMs || '1200');
+    bot._chatWindowMs = parseInt(process.env.CHAT_WINDOW_MS || cfgChat.windowMs || '30000');
+    bot._chatMaxPerWindow = parseInt(process.env.CHAT_MAX_PER_WINDOW || cfgChat.maxPerWindow || '6');
+
     bot._enqueueChat = function (message) {
       if (!message || typeof message !== 'string') return;
-      // sanitize message
       const msg = message.trim(); if (!msg) return;
       const now = Date.now();
-      // drop exact duplicates seen recently
-      if (bot._chatHistory.some(h => h.msg === msg && (now - h.ts) < WINDOW_MS)) return;
-      // enforce per-window limit
-      bot._chatHistory = bot._chatHistory.filter(h => (now - h.ts) < WINDOW_MS);
-      if (bot._chatHistory.length >= MAX_PER_WINDOW) {
-        // too chatty — drop message to avoid kick
-        return;
-      }
+      if (bot._chatHistory.some(h => h.msg === msg && (now - h.ts) < bot._chatWindowMs)) return;
+      bot._chatHistory = bot._chatHistory.filter(h => (now - h.ts) < bot._chatWindowMs);
+      if (bot._chatHistory.length >= bot._chatMaxPerWindow) return; // drop to avoid kick
       bot._chatHistory.push({ msg, ts: now });
-      // collapse last queued identical message
       const lastQueued = bot._chatQueue.length ? bot._chatQueue[bot._chatQueue.length - 1] : null;
       if (lastQueued === msg) return;
       bot._chatQueue.push(msg);
       if (!bot._chatBusy) bot._processChatQueue();
     };
+
     bot._processChatQueue = function () {
       if (bot._chatQueue.length === 0) { bot._chatBusy = false; return; }
       bot._chatBusy = true;
@@ -122,12 +138,11 @@ function startBot() {
         if (!bot._rawChat && typeof bot.chat === 'function') bot._rawChat = bot.chat.bind(bot);
         if (bot._rawChat) bot._rawChat(next);
       } catch (e) {}
-      const jitter = Math.floor(Math.random()*400); // random jitter up to 400ms
-      setTimeout(() => bot._processChatQueue(), MIN_CHAT_MS + jitter);
+      const jitter = Math.floor(Math.random()*400);
+      setTimeout(() => bot._processChatQueue(), bot._chatMinMs + jitter);
     };
-    // override chat to enqueue messages (keeps compatibility)
+    // override chat to enqueue messages
     if (typeof bot.chat === 'function') {
-      // preserve raw chat implementation
       if (!bot._rawChat) bot._rawChat = bot.chat.bind(bot);
       bot.chat = function (message) { bot._enqueueChat(message); };
     } else {
@@ -137,6 +152,8 @@ function startBot() {
 
   bot.on('spawn', () => {
     console.log(`✅ Connected as ${bot.username}`);
+    // clear reconnect flag on successful spawn
+    reconnecting = false;
     try { bot.chat('Hello! I am a simple bot.'); } catch (e) { /* may fail on headless servers */ }
 
     // Auto-defend: if health drops and a hostile is nearby, engage PvP task automatically
@@ -146,28 +163,32 @@ function startBot() {
         try {
           const prev = bot._lastHealth || bot.health;
           if (bot.health < prev) {
-            // damage observed — look for nearest hostile
-            const hostileNames = ['zombie','skeleton','creeper','spider','enderman','witch','pillager','vindicator','evoker','hoglin','blaze'];
-            const ents = Object.values(bot.entities).filter(e => e && e.position && e.type === 'mob');
-            let nearest = null; let nd = Infinity;
-            for (const e of ents) {
-              const n = (e.name || '').toLowerCase();
-              if (hostileNames.some(h => n.includes(h))) {
-                const d = bot.entity.position.distanceTo(e.position);
-                if (d < nd) { nd = d; nearest = e; }
-              }
-            }
-            if (nearest) {
-              try { bot.chat('Under attack — engaging nearby threat.'); } catch (e) {}
-              try { require('./modules/tasks/pvp').run(bot, ['nearest'], { duration: 20000 }); } catch (e) {}
+            // damage observed — prefer the last known attacker if available, otherwise nearest hostile
+            let attacker = null;
+            try {
+              const logic = require('./modules/brain/logic');
+              attacker = logic.getLastAttacker(bot) || logic.getNearestHostile(bot);
+            } catch (e) {}
+            if (attacker) {
+              try { bot.chat('Under attack by ' + (attacker.username || attacker.name || attacker.type) + ' — engaging attacker.'); } catch (e) {}
+              try {
+                const p = require('./modules/tasks/pvp').run(bot, [attacker], { duration: 60000 });
+                if (p && p.catch) p.catch(err => console.warn('PvP task failed:', err && (err.message || err)));
+              } catch (e) { console.warn('Failed to launch PvP task:', e && e.message); }
             } else {
-              try { bot.chat('Damage observed but no nearby hostile found.'); } catch (e) {}
+              try { bot.chat('Damage observed but no attacker identified.'); } catch (e) {}
             }
           }
         } catch (e) {}
         bot._lastHealth = bot.health;
       });
     } catch (e) { /* ignore health listener errors */ }
+
+    // initialize global logic hostile tracker
+    try { const logic = require('./modules/brain/logic'); logic.init(bot); } catch (e) {}
+
+    // register bot with model manager to enable snapshot saves on exit
+    try { const manager = require('./modules/models/manager'); manager.registerBot(bot, 'generic'); } catch (e) {}
 
     // Console stdin chat bridge
     try {
@@ -213,6 +234,12 @@ function startBot() {
         } catch (e) { console.warn('Failed to start auth autorefresh:', e.message); }
       }
     } catch (e) { console.warn('Config load failed:', e.message); }
+
+    // Register bot with model manager to save snapshot on exit
+    try {
+      const manager = require('./modules/models/manager');
+      manager.registerBot(bot, 'generic');
+    } catch (e) { /* ignore */ }
   });
 
   // aggressive dig toggle (disabled by default unless env set)
@@ -243,13 +270,12 @@ function startBot() {
         } else if (cmd === 'train') {
           const sub = args[0];
           if (sub === 'start') {
-            try { bot.chat('Starting local trainer (see server console).'); } catch (e) {}
-            const trainer = require('./train/neuroevolve');
-            trainer.run().catch(e=>console.error(e));
+            try { bot.chat('Starting local trainer (background).'); } catch (e) {}
+            try { const ok = startTrainer(); bot.chat(ok ? 'Trainer started' : 'Trainer already running'); } catch (e) { console.error(e); bot.chat('Failed to start trainer: '+(e.message||e)); }
           } else if (sub === 'status') {
-            try { bot.chat('Trainer status: see server console for details.'); } catch (e) {}
+            try { bot.chat('Trainer status: ' + (trainerProc ? 'running' : 'stopped')); } catch (e) {}
           } else if (sub === 'stop') {
-            try { bot.chat('Stop requested: trainer stop not implemented in scaffold.'); } catch (e) {}
+            try { const ok = stopTrainer(); bot.chat(ok ? 'Trainer stop requested' : 'Trainer was not running'); } catch (e) { bot.chat('Failed to stop trainer: '+(e.message||e)); }
           } else {
             try { bot.chat('Usage: !train start|status|stop'); } catch (e) {}
           }
@@ -354,7 +380,8 @@ function startBot() {
             const path = require('path'); const fs = require('fs');
             const MODELS_ROOT = path.resolve(__dirname, 'models');
             // merge old generation checkpoints and prune global checkpoints first
-            try { if (typeof manager.revampSaveSystem === 'function') manager.revampSaveSystem(10); } catch (e) {}
+            try { if (args.includes('fine')) process.env.ENABLE_FINE_TUNE = '1'; } catch (e) {}
+            try { if (typeof manager.mergeSavesAndPrune === 'function') manager.mergeSavesAndPrune(10); } catch (e) {}
             try { if (typeof manager.pruneGlobal === 'function') manager.pruneGlobal(10); } catch (e) {}
             // For each task directory, combine top candidates and keep only newest N files
             const TARGET_PER_TASK = parseInt(process.env.CLEAN_TARGET_PER_TASK || '10');
@@ -378,6 +405,27 @@ function startBot() {
             }
             bot.chat('Clean completed: pruned and combined model saves (target per task: '+TARGET_PER_TASK+').');
           } catch (e) { bot.chat('Clean failed: ' + (e && e.message)); }
+        } else if (cmd === 'merge') {
+          try {
+            const manager = require('./modules/models/manager');
+            const keep = parseInt(args[0]) || 3;
+            const fine = args[1] === 'fine' || args.includes('fine');
+            if (fine) process.env.ENABLE_FINE_TUNE = '1';
+            const out = manager.mergeSavesAndPrune(keep);
+            bot.chat('Merge completed: ' + (out || 'no merged output'));
+          } catch (e) { bot.chat('Merge failed: ' + (e && e.message)); }
+        } else if (cmd === 'leave') {
+          // save snapshot and gracefully disconnect
+          try {
+            const manager = require('./modules/models/manager');
+            manager.writeSnapshot(bot, 'leave', 'manual');
+          } catch (e) {}
+          try {
+            // allow explicit leave
+            bot._allowQuit = true;
+            if (bot._origQuit) bot._origQuit('Leaving'); else try { bot.quit('Leaving'); } catch (e) {}
+            bot._allowQuit = false;
+          } catch (e) { try { bot.end(); } catch (e2) {} }
         } else {
           bot.chat(`Unknown command: ${cmd}`);
         }
@@ -395,9 +443,48 @@ function startBot() {
     }
   });
 
-  bot.on('kicked', (reason) => console.log('Kicked:', reason));
+  bot.on('kicked', (reason) => {
+    try {
+      console.log('Kicked:', reason);
+      try { const manager = require('./modules/models/manager'); manager.writeSnapshot(bot, 'kicked'); } catch (e) {}
+      try { bot._episodeLog = bot._episodeLog || { inputs:[], outputs:[], actions:[], planLog:[] }; bot._episodeLog.kicks = bot._episodeLog.kicks || []; bot._episodeLog.kicks.push({ ts: Date.now(), reason }); } catch (e) {}
+      // simple heuristic: if reason indicates spam or chat, reduce chat rate and persist
+      const r = (reason || '').toLowerCase();
+      if (r.includes('spam') || r.includes('chat') || r.includes('flood')) {
+        try {
+          // adjust runtime chat params
+          bot._chatMaxPerWindow = Math.max(1, (bot._chatMaxPerWindow || 6) - 1);
+          bot._chatMinMs = (bot._chatMinMs || 1200) + 500;
+          // persist to config
+          try {
+            const cfg = config.load(); cfg.chat = cfg.chat || {}; cfg.chat.maxPerWindow = bot._chatMaxPerWindow; cfg.chat.minMs = bot._chatMinMs; cfg.chat.windowMs = bot._chatWindowMs || cfg.chat.windowMs || 30000; config.save(cfg);
+          } catch (e) {}
+        } catch (e) {}
+      }
+    } catch (e) { console.log('Kicked handler error', e); }
+    try {
+      if (!bot._allowQuit && !reconnecting) {
+        reconnecting = true;
+        console.log('Auto-reconnect scheduled after kick');
+        setTimeout(() => {
+          try { startBot(); } catch (e) { console.warn('Auto-reconnect failed:', e && e.message); reconnecting = false; }
+        }, 3000);
+      }
+    } catch (e) {}
+  });
   bot.on('error', (err) => console.error('Error:', err));
-  bot.on('end', () => console.log('Disconnected'));
+  bot.on('end', () => {
+    console.log('Disconnected');
+    try {
+      if (!bot._allowQuit && !reconnecting) {
+        reconnecting = true;
+        console.log('Auto-reconnect scheduled after disconnect');
+        setTimeout(() => {
+          try { startBot(); } catch (e) { console.warn('Auto-reconnect failed:', e && e.message); reconnecting = false; }
+        }, 1500);
+      }
+    } catch (e) {}
+  });
 }
 
 // Start first bot instance
@@ -411,7 +498,10 @@ fs.watchFile(authFilePath, { interval: 5000 }, (curr, prev) => {
     try {
       if (bot) {
         console.log('Reconnecting bot to apply updated auth tokens...');
-        try { bot.quit('Reconnecting with refreshed auth'); } catch (e) { try { bot.end(); } catch (e2) {} }
+        try {
+          // allow reconnect quit
+          if (bot) { bot._allowQuit = true; if (bot._origQuit) bot._origQuit('Reconnecting with refreshed auth'); else try { bot.quit('Reconnecting with refreshed auth'); } catch (e2) {} bot._allowQuit = false; }
+        } catch (e) { try { bot.end(); } catch (e2) {} }
         setTimeout(() => { startBot(); }, 1500);
       } else {
         startBot();
@@ -459,6 +549,8 @@ function startModelWatcher(deployOnChange = true) {
             // modelController is a Promise; attach catch
             modelController.catch(e => console.warn('Model controller error:', e.message));
             console.log('Auto-started live controller for new model');
+            // start per-task watchers to autoload per-task bests
+            try { if (policy.startAllTaskWatches) policy.startAllTaskWatches(); } catch (e) { console.warn('Failed to start per-task watchers:', e.message); }
           } catch (e) { console.warn('Failed to autodeploy model controller:', e.message); }
         }
       } catch (e) { console.warn('Auto-reload model failed:', e.message); }
@@ -467,5 +559,22 @@ function startModelWatcher(deployOnChange = true) {
   console.log('Started watching model for autodeploy:', modelPath);
   return true;
 }
-function stopModelWatcher() { try { if (modelWatcher) require('fs').unwatchFile(require('path').resolve(__dirname, 'models', 'best-latest.json')); modelWatcher = null; } catch (e) {} }
+function stopModelWatcher() { try { if (modelWatcher) require('fs').unwatchFile(require('path').resolve(__dirname, 'models', 'best-latest.json')); modelWatcher = null; } catch (e) {} try { stopAllTaskWatchers(); } catch (e) {} }
+function stopAllTaskWatchers() { try { const policy = require('./modules/policy/nn_policy'); if (policy.stopAllTaskWatches) policy.stopAllTaskWatches(); } catch (e) { console.warn('Failed to stop per-task watchers', e.message); } }
+
+// Ensure snapshot on process signals
+try {
+  const manager = require('./modules/models/manager');
+  process.on('SIGINT', () => {
+    try { if (bot) manager.writeSnapshot(bot, 'SIGINT'); } catch (e) {}
+    try { manager.mergeSavesAndPrune(3); } catch (e) {}
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    try { if (bot) manager.writeSnapshot(bot, 'SIGTERM'); } catch (e) {}
+    try { manager.mergeSavesAndPrune(3); } catch (e) {}
+    process.exit(0);
+  });
+  process.on('exit', (code) => { try { if (bot) manager.writeSnapshot(bot, 'exit'); } catch (e) {} });
+} catch (e) {}
 
