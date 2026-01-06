@@ -1,0 +1,32 @@
+{
+  "name": "minecraft-bot",
+  "version": "0.1.0",
+  "description": "Simple mineflayer bot that can connect to servers and interact",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "train": "node train/neuroevolve.js",
+    "train:collect": "node train/neuroevolve.js",
+    "train:test": "node train/tests/train_improvement_test.js",
+    "eval:live": "node train/eval_live.js",
+    "auth:device": "node auth/device_flow.js",
+    "auth:refresh": "node auth/refresh_tokens.js",
+    "auth:test-msal": "node auth/validate_msal.js",
+    "test:tasks": "node test/task_smoke.js",
+    "test:integration": "node test/integration_tasks.js",
+    "test:integration:local": "node test/run_integration_local.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "mineflayer": "^4.0.0",
+    "mineflayer-pathfinder": "^1.0.0",
+    "mineflayer-pvp": "^1.3.2",
+    "neataptic": "^1.4.7",
+    "node-fetch": "^2.6.7"
+  },
+  "devDependencies": {
+    "minecraft-protocol": "^1.32.0",
+    "mocha": "^10.2.0"
+  }
+}
